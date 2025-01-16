@@ -1,0 +1,12 @@
+{
+    "name": "alien-signals-starter",
+    "scripts": {
+        "start": "tsx start.ts"
+    },
+    "devDependencies": {
+        "tsx": "latest"
+    },
+    "dependencies": {
+        "alien-signals": "^1.0.0"
+    }
+}

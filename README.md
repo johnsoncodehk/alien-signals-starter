@@ -5,7 +5,7 @@ Use the `createReactiveSystem` API to build a simple signal library.
 ## Usage
 
 ```ts
-import { signal, computed, effect } from 'alien-signals';
+import { signal, computed, effect } from 'alien-signals-starter';
 
 const count = signal(1);
 const doubleCount = computed(() => count.get() * 2);

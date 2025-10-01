@@ -7,6 +7,6 @@
         "tsx": "latest"
     },
     "dependencies": {
-        "alien-signals": "^1.0.0"
+        "alien-signals": "^3.0.0"
     }
 }

@@ -1,35 +1,26 @@
-import { createReactiveSystem, Dependency, Link, Subscriber, SubscriberFlags } from 'alien-signals';
+import { createReactiveSystem, Link, ReactiveNode, ReactiveFlags } from 'alien-signals/system';
 
 const {
 	link,
+	unlink,
 	propagate,
-	endTracking,
-	startTracking,
-	updateDirtyFlag,
-	processComputedUpdate,
-	processEffectNotifications,
+	checkDirty,
+	shallowPropagate,
 } = createReactiveSystem({
-	updateComputed(computed: Computed) {
-		return computed.update();
+	update(signal: Computed | Signal) {
+		return signal.update();
 	},
-	notifyEffect(effect: Effect) {
-		effect.notify();
-		return true;
+	notify(effect: Effect) {
+		queue.push(effect);
 	},
+	unwatched() { },
 });
 
-let activeSub: Subscriber | undefined = undefined;
+let cycle = 0;
 let batchDepth = 0;
+let activeSub: ReactiveNode | undefined;
 
-export function startBatch(): void {
-	++batchDepth;
-}
-
-export function endBatch(): void {
-	if (!--batchDepth) {
-		processEffectNotifications();
-	}
-}
+const queue: Effect[] = [];
 
 export function signal<T>(): Signal<T | undefined>;
 export function signal<T>(oldValue: T): Signal<T>;
@@ -37,84 +28,8 @@ export function signal<T>(oldValue?: T): Signal<T | undefined> {
 	return new Signal(oldValue);
 }
 
-export class Signal<T = any> implements Dependency {
-	// Dependency fields
-	subs: Link | undefined = undefined;
-	subsTail: Link | undefined = undefined;
-
-	constructor(
-		public currentValue: T
-	) { }
-
-	get(): T {
-		if (activeSub !== undefined) {
-			link(this, activeSub);
-		}
-		return this.currentValue;
-	}
-
-	set(value: T): void {
-		if (this.currentValue !== value) {
-			this.currentValue = value;
-			const subs = this.subs;
-			if (subs !== undefined) {
-				propagate(subs);
-				if (!batchDepth) {
-					processEffectNotifications();
-				}
-			}
-		}
-	}
-}
-
 export function computed<T>(getter: () => T): Computed<T> {
 	return new Computed<T>(getter);
-}
-
-export class Computed<T = any> implements Subscriber, Dependency {
-	currentValue: T | undefined = undefined;
-
-	// Dependency fields
-	subs: Link | undefined = undefined;
-	subsTail: Link | undefined = undefined;
-
-	// Subscriber fields
-	deps: Link | undefined = undefined;
-	depsTail: Link | undefined = undefined;
-	flags: SubscriberFlags = SubscriberFlags.Computed | SubscriberFlags.Dirty;
-
-	constructor(
-		public getter: () => T
-	) { }
-
-	get(): T {
-		const flags = this.flags;
-		if (flags & (SubscriberFlags.PendingComputed | SubscriberFlags.Dirty)) {
-			processComputedUpdate(this, flags);
-		}
-		if (activeSub !== undefined) {
-			link(this, activeSub);
-		}
-		return this.currentValue!;
-	}
-
-	update(): boolean {
-		const prevSub = activeSub;
-		activeSub = this;
-		startTracking(this);
-		try {
-			const oldValue = this.currentValue;
-			const newValue = this.getter();
-			if (oldValue !== newValue) {
-				this.currentValue = newValue;
-				return true;
-			}
-			return false;
-		} finally {
-			activeSub = prevSub;
-			endTracking(this);
-		}
-	}
 }
 
 export function effect<T>(fn: () => T): Effect<T> {
@@ -123,40 +38,153 @@ export function effect<T>(fn: () => T): Effect<T> {
 	return e;
 }
 
-export class Effect<T = any> implements Subscriber {
-	// Subscriber fields
+export function startBatch() {
+	++batchDepth;
+}
+
+export function endBatch() {
+	if (--batchDepth === 0) {
+		flush();
+	}
+}
+
+function flush() {
+	while (queue.length > 0) {
+		queue.shift()!.run();
+	}
+}
+
+function shouldUpdate(sub: ReactiveNode): boolean {
+	const flags = sub.flags;
+	if (flags & ReactiveFlags.Dirty) {
+		return true;
+	}
+	if (flags & ReactiveFlags.Pending) {
+		if (checkDirty(sub.deps!, sub)) {
+			return true;
+		}
+		sub.flags = flags & ~ReactiveFlags.Pending;
+	}
+	return false;
+}
+
+class Signal<T = any> implements ReactiveNode {
+	subs: Link | undefined = undefined;
+	subsTail: Link | undefined = undefined;
+	flags: ReactiveFlags = ReactiveFlags.Mutable;
+	value: T;
+	pendingValue: T;
+
+	constructor(value: T) {
+		this.pendingValue = this.value = value;
+	}
+
+	get(): T {
+		if (shouldUpdate(this) && this.update()) {
+			const subs = this.subs;
+			if (subs !== undefined) {
+				shallowPropagate(subs);
+			}
+		}
+		if (activeSub !== undefined) {
+			link(this, activeSub, cycle);
+		}
+		return this.value;
+	}
+
+	set(value: T): void {
+		this.pendingValue = value;
+		this.flags = ReactiveFlags.Mutable | ReactiveFlags.Dirty;
+		const subs = this.subs;
+		if (subs !== undefined) {
+			propagate(subs);
+			if (batchDepth === 0) {
+				flush();
+			}
+		}
+	}
+
+	update() {
+		this.flags = ReactiveFlags.Mutable;
+		return this.value !== (this.value = this.pendingValue);
+	}
+}
+
+class Computed<T = any> implements ReactiveNode {
+	value: T | undefined = undefined;
+	subs: Link | undefined = undefined;
+	subsTail: Link | undefined = undefined;
 	deps: Link | undefined = undefined;
 	depsTail: Link | undefined = undefined;
-	flags: SubscriberFlags = SubscriberFlags.Effect;
+	flags: ReactiveFlags = ReactiveFlags.Mutable | ReactiveFlags.Dirty;
+
+	constructor(
+		public getter: () => T
+	) { }
+
+	get(): T {
+		if (shouldUpdate(this) && this.update()) {
+			const subs = this.subs;
+			if (subs !== undefined) {
+				shallowPropagate(subs);
+			}
+		}
+		if (activeSub !== undefined) {
+			link(this, activeSub, cycle);
+		}
+		return this.value!;
+	}
+
+	update(): boolean {
+		++cycle;
+		this.depsTail = undefined;
+		this.flags = ReactiveFlags.Mutable | ReactiveFlags.RecursedCheck;
+		const prevSub = activeSub;
+		activeSub = this;
+		try {
+			return this.value !== (this.value = this.getter());
+		} finally {
+			activeSub = prevSub;
+			this.flags &= ~ReactiveFlags.RecursedCheck;
+			let toRemove = this.depsTail !== undefined ? (this.depsTail as Link).nextDep : this.deps;
+			while (toRemove !== undefined) {
+				toRemove = unlink(toRemove, this);
+			}
+		}
+	}
+}
+
+class Effect<T = any> implements ReactiveNode {
+	deps: Link | undefined = undefined;
+	depsTail: Link | undefined = undefined;
+	flags: ReactiveFlags = ReactiveFlags.Watching;
 
 	constructor(
 		public fn: () => T
 	) { }
 
-	notify(): void {
-		const flags = this.flags;
-		if (
-			flags & SubscriberFlags.Dirty
-			|| (flags & SubscriberFlags.PendingComputed && updateDirtyFlag(this, flags))
-		) {
-			this.run();
-		}
-	}
-
 	run(): T {
+		++cycle;
+		this.depsTail = undefined;
+		this.flags = ReactiveFlags.Watching | ReactiveFlags.RecursedCheck;
 		const prevSub = activeSub;
 		activeSub = this;
-		startTracking(this);
 		try {
 			return this.fn();
 		} finally {
 			activeSub = prevSub;
-			endTracking(this);
+			this.flags &= ~ReactiveFlags.RecursedCheck;
+			let toRemove = this.depsTail !== undefined ? (this.depsTail as Link).nextDep : this.deps;
+			while (toRemove !== undefined) {
+				toRemove = unlink(toRemove, this);
+			}
 		}
 	}
 
 	stop(): void {
-		startTracking(this);
-		endTracking(this);
+		let dep = this.deps;
+		while (dep !== undefined) {
+			dep = unlink(dep, this);
+		}
 	}
 }
